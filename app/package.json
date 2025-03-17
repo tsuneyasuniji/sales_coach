@@ -1,0 +1,22 @@
+{
+    "name": "real_time_support",
+    "version": "1.0.0",
+    "scripts": {
+        "dev": "ts-node src/index.ts",
+        "build": "tsc",
+        "start": "node dist/index.js"
+    },
+    "dependencies": {
+        "chromadb": "^1.10.5",
+        "dotenv": "^16.0.3",
+        "express": "^4.18.2",
+        "langchain": "^0.0.77",
+        "openai": "^3.2.1"
+    },
+    "devDependencies": {
+        "@types/express": "^4.17.17",
+        "@types/node": "^18.15.3",
+        "ts-node": "^10.9.1",
+        "typescript": "^5.0.4"
+    }
+}

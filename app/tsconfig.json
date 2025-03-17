@@ -1,0 +1,13 @@
+{
+    "compilerOptions": {
+      "module": "commonjs",          // CommonJS に設定
+      "target": "es2020",
+      "outDir": "dist",
+      "rootDir": "src",
+      "esModuleInterop": true,       // import 文でデフォルトエクスポートを扱いやすくする
+      "forceConsistentCasingInFileNames": true,
+      "strict": true
+    },
+    "include": ["src"]
+  }
+  
