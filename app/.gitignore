@@ -6,4 +6,3 @@ node_modules/
 
 # package-lock.json（ロックファイルはコミットしない場合）
 package-lock.json
-.DS_Store
