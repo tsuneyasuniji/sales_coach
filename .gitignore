@@ -1,0 +1,8 @@
+# node_modulesフォルダ
+node_modules/
+
+# 環境変数ファイル（機密情報を含むため）
+.env
+
+# package-lock.json（ロックファイルはコミットしない場合）
+package-lock.json
