@@ -4,6 +4,7 @@ import { askApi, getCoachingSuggestions } from './api/askApi';
 import './styles/App.css';
 import { BrowserRouter as Router, Route, Switch, Link } from 'react-router-dom';
 import MinutesCreator from './components/MinutesCreator';
+import KnowledgeManager from './components/KnowledgeManager';
 
 
 // APIとの通信を行う関数
@@ -46,8 +47,14 @@ const SpeechRecognitionComponent: React.FC<{ onMessage: (speaker: string, messag
     transcript,
     listening,
     resetTranscript,
-    browserSupportsSpeechRecognition,
+    browserSupportsSpeechRecognition
   } = useSpeechRecognition();
+  
+  // ブラウザがSpeechRecognitionをサポートしていない場合
+  if (!browserSupportsSpeechRecognition) {
+    return <div>ブラウザはこの機能をサポートしていません。</div>;
+  }
+  
   const [isListening, setIsListening] = useState(listening);
   const [editableText, setEditableText] = useState('');
 
@@ -92,10 +99,6 @@ const SpeechRecognitionComponent: React.FC<{ onMessage: (speaker: string, messag
     resetTranscript();
     setEditableText('');
   };
-
-  if (!browserSupportsSpeechRecognition) {
-    return <div>ブラウザはこの機能をサポートしていません。</div>;
-  }
 
   return (
     <div className="speech-recognition">
@@ -384,6 +387,9 @@ const App: React.FC = () => {
               <li>
                 <Link to="/minutes">議事録作成</Link>
               </li>
+              <li>
+                <Link to="/knowledge">ナレッジベース管理</Link>
+              </li>
             </ul>
           </nav>
         </div>
@@ -394,6 +400,9 @@ const App: React.FC = () => {
             </Route>
             <Route path="/minutes">
               <MinutesCreator messages={messages} />
+            </Route>
+            <Route path="/knowledge">
+              <KnowledgeManager />
             </Route>
           </Switch>
         </div>

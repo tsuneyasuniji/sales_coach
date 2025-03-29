@@ -10,7 +10,7 @@ const API_BASE_URL = process.env.REACT_APP_API_BASE_URL || 'http://localhost:300
 
 export const askApi = async (question: string): Promise<ApiResponse> => {
   try {
-    console.log(`Sending request to: ${API_BASE_URL}/ask`); // デバッグ用ログ
+    console.log(`Sending request to: ${process.env.REACT_APP_API_BASE_URL || 'http://localhost:3000'}/ask`);
     const response = await fetch(`${process.env.REACT_APP_API_BASE_URL || 'http://localhost:3000'}/ask`, {
       method: 'POST',
       headers: {
@@ -18,14 +18,17 @@ export const askApi = async (question: string): Promise<ApiResponse> => {
       },
       body: JSON.stringify({ question }),
     });
-
+    
     if (!response.ok) {
-      throw new Error(`API request failed with status ${response.status}`);
+      const errorData = await response.json().catch(() => ({}));
+      console.error("API Error Response:", errorData);
+      throw new Error(`API request failed with status ${response.status}: ${errorData.message || ''}`);
     }
-
-    return await response.json();
+    
+    const data = await response.json();
+    return data;
   } catch (error: any) {
-    console.error('Error calling API:', error);
+    console.error("Error during API call:", error);
     return { 
       answer: "", 
       error: `APIリクエストに失敗しました: ${error.message}` 

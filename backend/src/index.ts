@@ -15,7 +15,22 @@ import { OpenAI } from "langchain/llms/openai";
 import fs from "fs";
 import path from "path";
 import cors from "cors";
-import { MemoryVectorStore } from "langchain/vectorstores/memory";
+
+// Pineconeをインポート
+import { Pinecone } from "@pinecone-database/pinecone";
+import { PineconeStore } from "langchain/vectorstores/pinecone";
+
+// Multerの型をインポート
+import multer from 'multer';
+
+// ExpressのRequest型を拡張
+declare global {
+  namespace Express {
+    interface Request {
+      file?: Express.Multer.File; // multerによって追加されるfileプロパティ
+    }
+  }
+}
 
 // ③ シンプルなロガーの定義（INFO, ERROR レベルでログ出力）
 const logger = {
@@ -27,11 +42,24 @@ const logger = {
   },
 };
 
-// ④ OpenAI Embeddings のグローバルインスタンスを生成（必要に応じて利用）
+// ④ OpenAI Embeddings のグローバルインスタンスを生成
 const embeddings = new OpenAIEmbeddings({
   openAIApiKey: process.env.OPEN_API_KEY,
   // model: "text-embedding-ada-002", // 使用する埋め込みモデルを指定したい場合は有効化
 });
+
+class PineconeClientSingleton {
+  private static instance: Pinecone | null = null;
+
+  public static getInstance(): Pinecone {
+    if (!this.instance) {
+      this.instance = new Pinecone({
+        apiKey: process.env.PINECONE_API_KEY || "",
+      });
+    }
+    return this.instance;
+  }
+}
 
 /**
  * SalesCoachAgentクラス
@@ -47,8 +75,14 @@ class SalesCoachAgent {
   // コンストラクタをprivateにして外部からの直接インスタンス化を防ぐ
   private constructor() {
     logger.info("SalesCoachAgent constructor called.");
+    
     // 初期化処理（initChain）を開始し、そのPromiseをキャッシュします
     this.chainPromise = this.initChain();
+    
+    // 既存のナレッジを確認してから初期化
+    this.checkAndInitializeKnowledge().catch(err => {
+      logger.error("Failed to check and initialize knowledge:", err);
+    });
   }
 
   /**
@@ -64,83 +98,195 @@ class SalesCoachAgent {
   }
 
   /**
-   * ask() メソッド
-   * ユーザーの質問を受け取り、構築済みのRetrievalQAChainを使用して回答を生成します。
-   * @param question ユーザーからの質問テキスト
-   * @returns LLM が生成した回答テキスト
+   * initChain() メソッド
+   * LangChainのRetrievalQAChainを初期化します。
+   * このメソッドは非同期で実行され、初期化が完了するとPromiseが解決されます。
    */
-  public async ask(question: string): Promise<string> {
-    logger.info(`SalesCoachAgent.ask() invoked with question: "${question}"`);
+  private async initChain(): Promise<RetrievalQAChain> {
     try {
-      // initChain() で作成したRetrievalQAChainのインスタンスを取得
-      const chain = await this.chainPromise;
-      logger.info("RetrievalQAChain is ready. Calling .call() ...");
-      // チェーンに対して質問を渡し、回答結果を取得
-      const result = await chain.call({ query: question });
-      logger.info("LLM result received:", result);
-      return result.text;
+      logger.info("Initializing RetrievalQAChain...");
+
+      // Pineconeクライアントの初期化
+      const client = PineconeClientSingleton.getInstance();
+      const indexName = process.env.PINECONE_INDEX_NAME || "sales-coach";
+      const pineconeIndex = client.index(indexName);
+
+      // カスタムレトリーバーを作成
+      const retriever = {
+        getRelevantDocuments: async (query: string) => {
+          try {
+            // クエリの埋め込みを生成
+            const queryEmbedding = await embeddings.embedQuery(query);
+            
+            // Pineconeに問い合わせ
+            const results = await pineconeIndex.query({
+              vector: queryEmbedding,
+              topK: 5,
+              includeMetadata: true
+            });
+            
+            // 結果をドキュメントに変換
+            return results.matches.map(match => {
+              return new Document({
+                pageContent: match.metadata?.pageContent ? String(match.metadata.pageContent) : "デフォルトのコンテンツ",
+                metadata: {
+                  source: match.metadata?.source ? String(match.metadata.source) : "不明",
+                },
+              });
+            });
+          } catch (error) {
+            logger.error("Error in retriever:", error);
+            return []; // エラー時は空の配列を返す
+          }
+        }
+      };
+
+      // OpenAIモデルの初期化
+      const model = new OpenAI({
+        openAIApiKey: process.env.OPEN_API_KEY,
+        temperature: 0,
+        modelName: "gpt-4o-mini",
+      });
+
+      // RetrievalQAChainの作成
+      const chain = RetrievalQAChain.fromLLM(model, retriever);
+
+      logger.info("RetrievalQAChain initialized successfully.");
+      return chain;
     } catch (error) {
-      logger.error("Error in SalesCoachAgent.ask():", error);
+      logger.error("Error initializing RetrievalQAChain:", error);
       throw error;
     }
   }
 
   /**
-   * initChain() メソッド
-   * 以下の手順でRetrievalQAChainを初期化します:
-   * 1. ローカルのテキストファイル (fake_db.txt) を読み込み
-   * 2. ファイル内容を Document オブジェクトに変換
-   * 3. OpenAIEmbeddings を初期化し、Document をベクトル化
-   * 4. MemoryVectorStore を作成
-   * 5. OpenAI の LLM をセットアップし、MemoryVectorStore と組み合わせたRetrievalQAChain を構築
+   * ask() メソッド
+   * ユーザーからの質問に対して回答を生成します。
+   * @param question ユーザーからの質問
+   * @returns 生成された回答
    */
-  private async initChain(): Promise<RetrievalQAChain> {
-    logger.info("Initializing chain with MemoryVectorStore...");
+  public async ask(question: string): Promise<string> {
     try {
-      // APIキーの確認
-      const apiKey = process.env.OPEN_API_KEY;
+      // chainPromiseが解決されるのを待ち、初期化されたchainを取得
+      const chain = await this.chainPromise;
       
-      if (!apiKey) {
-        throw new Error("OPEN_API_KEY is not set in environment variables.");
-      }
-
-      // 1. テキストファイル読み込み
-      const dbPath = path.join(__dirname, "data", "test_knowledge.txt");
-      logger.info("Checking file at:", dbPath);
-      if (!fs.existsSync(dbPath)) {
-        logger.error(`File not found: ${dbPath}`);
-        throw new Error(`File not found: ${dbPath}`);
-      }
-      const content = fs.readFileSync(dbPath, "utf-8");
-      logger.info(`File loaded. content length: ${content.length} chars`);
-
-      // 2. Document配列を作成
-      const docs = [new Document({ pageContent: content })];
-
-      // 3. OpenAIEmbeddings の初期化
-      const embeddings = new OpenAIEmbeddings({ openAIApiKey: apiKey });
-
-      // 4. MemoryVectorStore の作成（Document群とEmbeddingsから生成）
-      logger.info("Creating MemoryVectorStore...");
-      const vectorStore = await MemoryVectorStore.fromDocuments(docs, embeddings);
-      logger.info("MemoryVectorStore successfully created.");
-
-      // 5. OpenAI の LLM をセットアップ
-      logger.info("Setting up OpenAI for QA chain...");
-      const model = new OpenAI({
-        openAIApiKey: apiKey,
-        modelName: "gpt-4o-mini",
-        temperature: 0,
+      // 質問に対する回答を生成
+      const response = await chain.call({
+        query: question,
       });
-      logger.info("OpenAI model initialized successfully");
-      
-      // 6. LLM と MemoryVectorStore のレトリーバーを組み合わせた RetrievalQAChain を構築
-      const chain = RetrievalQAChain.fromLLM(model, vectorStore.asRetriever());
-      logger.info("RetrievalQAChain with MemoryVectorStore is successfully initialized.");
-      return chain;
+
+      return response.text;
     } catch (error) {
-      logger.error("Error in SalesCoachAgent.initChain():", error);
+      logger.error("Error in ask method:", error);
       throw error;
+    }
+  }
+
+  public async retrieveKnowledge(): Promise<Document[]> {
+    try {
+      const client = PineconeClientSingleton.getInstance();
+      const indexName = process.env.PINECONE_INDEX_NAME || "sales-coach";
+      const pineconeIndex = client.index(indexName);
+      
+      // 埋め込みを生成
+      const embeddingModel = new OpenAIEmbeddings({
+        openAIApiKey: process.env.OPEN_API_KEY,
+      });
+      
+      // ダミークエリの埋め込みを生成
+      const queryEmbedding = await embeddingModel.embedQuery("セールスコーチング");
+      
+      // Pineconeからナレッジを取得
+      const queryResponse = await pineconeIndex.query({
+        vector: queryEmbedding,
+        topK: 5,
+        includeMetadata: true
+      });
+
+      const docs: Document[] = queryResponse.matches.map(match => {
+        return new Document({
+          pageContent: match.metadata?.pageContent ? String(match.metadata.pageContent) : "デフォルトのコンテンツ",
+          metadata: {
+            source: match.metadata?.source ? String(match.metadata.source) : "不明",
+          },
+        });
+      });
+
+      return docs;
+    } catch (error) {
+      logger.error("Error retrieving knowledge from Pinecone:", error);
+      throw error;
+    }
+  }
+
+  private async initializeWithDefaultKnowledge(): Promise<void> {
+    try {
+      // 初期ナレッジデータ
+      const initialKnowledge = [
+        "セールスコーチングとは、営業担当者のスキルと成果を向上させるための指導プロセスです。",
+        "効果的な質問技法には、オープンクエスチョンとクローズドクエスチョンがあります。",
+        "顧客のニーズを理解することは、成功する営業の基本です。",
+        "商談では、顧客の課題を明確にし、その解決策を提案することが重要です。",
+        "営業プロセスは通常、見込み客の発掘、アプローチ、ニーズ分析、提案、クロージング、フォローアップの段階で構成されます。"
+      ];
+
+      // Pineconeクライアントの初期化
+      const client = PineconeClientSingleton.getInstance();
+      const indexName = process.env.PINECONE_INDEX_NAME || "sales-coach";
+      const pineconeIndex = client.index(indexName);
+      
+      // 各チャンクを処理
+      const records = [];
+      
+      for (let i = 0; i < initialKnowledge.length; i++) {
+        const text = initialKnowledge[i];
+        
+        // テキストの埋め込みを生成
+        const embedding = await embeddings.embedQuery(text);
+        
+        // レコードを作成
+        records.push({
+          id: `default-knowledge-${i}`,
+          values: embedding,
+          metadata: {
+            pageContent: text,
+            source: `default-knowledge-${i}`,
+          }
+        });
+      }
+      
+      // バッチサイズを設定（Pineconeの制限に合わせる）
+      const BATCH_SIZE = 100;
+      
+      // バッチ処理でPineconeにデータを挿入
+      for (let i = 0; i < records.length; i += BATCH_SIZE) {
+        const batch = records.slice(i, i + BATCH_SIZE);
+        await pineconeIndex.upsert(batch);
+      }
+
+      logger.info("Default knowledge added to Pinecone successfully.");
+    } catch (error) {
+      logger.error("Error adding default knowledge:", error);
+      // エラーをスローせず、処理を続行
+    }
+  }
+
+  private async checkAndInitializeKnowledge(): Promise<void> {
+    try {
+      // 既存のナレッジを確認
+      const docs = await this.retrieveKnowledge();
+      
+      // ナレッジが存在しない場合のみ初期化を実行
+      if (!docs || docs.length === 0) {
+        logger.info("No existing knowledge found. Initializing default knowledge...");
+        await this.initializeWithDefaultKnowledge();
+      } else {
+        logger.info(`Found ${docs.length} existing knowledge documents. Skipping initialization.`);
+      }
+    } catch (error) {
+      logger.error("Error checking knowledge:", error);
+      // エラー時は安全のため初期化を実行
+      await this.initializeWithDefaultKnowledge();
     }
   }
 }
@@ -151,20 +297,25 @@ const askRoute = Router();
 // POST /ask エンドポイントのハンドラー
 askRoute.post("/", async (req: Request, res: Response) => {
   const { question } = req.body;
+  
+  logger.info(`Received question: ${question}`);
+  
   if (!question) {
-    // リクエストボディにquestionが無い場合は400エラーを返す
     return res.status(400).json({ error: "Missing 'question' in request body" });
   }
 
   try {
-    // シングルトンインスタンスを取得
+    logger.info("Getting SalesCoachAgent instance...");
     const agent = SalesCoachAgent.getInstance();
+    
+    logger.info("Asking question to agent...");
     const answer = await agent.ask(question);
-    // 正常に回答が生成されたらJSON形式で返す
+    
+    logger.info(`Got answer: ${answer.substring(0, 50)}...`);
     res.json({ answer });
   } catch (error: any) {
     logger.error("Error in /ask route:", error);
-    // エラーメッセージをより詳細に
+    logger.error("Error stack:", error.stack);
     res.status(500).json({ 
       error: "Internal Server Error", 
       message: error.message,
@@ -180,7 +331,12 @@ async function main() {
   const app = express();
 
   // CORSを有効化（クロスオリジンリクエストを許可）
-  app.use(cors());
+  app.use(cors({
+    origin: ['http://localhost:3000', 'http://localhost:3001', 'http://localhost:8080'], // フロントエンドのURLを指定
+    methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
+    allowedHeaders: ['Content-Type', 'Authorization'],
+    credentials: true // クッキーを含むリクエストを許可
+  }));
 
   // JSONリクエストのパースを有効化
   app.use(express.json());
@@ -271,13 +427,151 @@ ${conversationText}
     }
   });
 
+  // ナレッジベース管理用のエンドポイント
+  app.post('/knowledge/add', async (req: Request, res: Response) => {
+    const { text, source } = req.body;
+    
+    if (!text) {
+      return res.status(400).json({ error: "テキストが必要です" });
+    }
+
+    try {
+      // テキストをチャンクに分割
+      const chunks = text.split("\n\n");
+      
+      // Pineconeクライアントの初期化
+      const client = PineconeClientSingleton.getInstance();
+      const indexName = process.env.PINECONE_INDEX_NAME || "sales-coach";
+      const pineconeIndex = client.index(indexName);
+      
+      // 各チャンクを処理
+      const records = [];
+      
+      for (let i = 0; i < chunks.length; i++) {
+        const chunk = chunks[i];
+        if (!chunk.trim()) continue; // 空のチャンクをスキップ
+        
+        // テキストの埋め込みを生成
+        const embedding = await embeddings.embedQuery(chunk);
+        
+        // レコードを作成
+        records.push({
+          id: `manual-${Date.now()}-${i}`,
+          values: embedding,
+          metadata: {
+            pageContent: chunk,
+            source: source || `manual-${Date.now()}-${i}`,
+          }
+        });
+      }
+      
+      // バッチサイズを設定（Pineconeの制限に合わせる）
+      const BATCH_SIZE = 100;
+      
+      // バッチ処理でPineconeにデータを挿入
+      for (let i = 0; i < records.length; i += BATCH_SIZE) {
+        const batch = records.slice(i, i + BATCH_SIZE);
+        await pineconeIndex.upsert(batch);
+      }
+      
+      res.json({ success: true, message: `${records.length}件のドキュメントが追加されました` });
+    } catch (error: any) {
+      logger.error("Pinecone error details:", {
+        message: error.message,
+        stack: error.stack,
+        cause: error.cause,
+        name: error.name,
+        code: error.code
+      });
+      res.status(500).json({ 
+        error: "Internal Server Error", 
+        message: error.message,
+        stack: process.env.NODE_ENV === 'development' ? error.stack : undefined
+      });
+    }
+  });
+
+  // ファイルアップロード用のミドルウェア設定
+  const upload = multer({ dest: 'uploads/' });
+
+  // ファイルアップロード用のエンドポイント
+  app.post('/knowledge/upload', upload.single('file'), async (req: Request, res: Response) => {
+    if (!req.file) {
+      return res.status(400).json({ error: "ファイルが必要です" });
+    }
+
+    try {
+      // アップロードされたファイルのパス
+      const filePath = req.file.path;
+      const text = fs.readFileSync(filePath, "utf8");
+      
+      // ファイル削除
+      fs.unlinkSync(filePath); // 処理が終わったらファイルを削除
+
+      // テキストをチャンクに分割
+      const chunks = text.split("\n\n");
+      
+      // Pineconeクライアントの初期化
+      const client = PineconeClientSingleton.getInstance();
+      const indexName = process.env.PINECONE_INDEX_NAME || "sales-coach";
+      const pineconeIndex = client.index(indexName);
+      
+      // 各チャンクを処理
+      const records = [];
+      
+      for (let i = 0; i < chunks.length; i++) {
+        const chunk = chunks[i];
+        if (!chunk.trim()) continue; // 空のチャンクをスキップ
+        
+        // テキストの埋め込みを生成
+        const embedding = await embeddings.embedQuery(chunk);
+        
+        // レコードを作成
+        records.push({
+          id: `file-${Date.now()}-${i}`,
+          values: embedding,
+          metadata: {
+            pageContent: chunk,
+            source: req.file?.originalname || `file-${Date.now()}-${i}`,
+          }
+        });
+      }
+      
+      // バッチサイズを設定（Pineconeの制限に合わせる）
+      const BATCH_SIZE = 100;
+      
+      // バッチ処理でPineconeにデータを挿入
+      for (let i = 0; i < records.length; i += BATCH_SIZE) {
+        const batch = records.slice(i, i + BATCH_SIZE);
+        await pineconeIndex.upsert(batch);
+      }
+      
+      res.json({ success: true, message: `${records.length}件のドキュメントが追加されました` });
+    } catch (error: any) {
+      logger.error("Pinecone error details:", {
+        message: error.message,
+        stack: error.stack,
+        cause: error.cause,
+        name: error.name,
+        code: error.code
+      });
+      res.status(500).json({ 
+        error: "Internal Server Error", 
+        message: error.message,
+        stack: process.env.NODE_ENV === 'development' ? error.stack : undefined
+      });
+    }
+  });
+
   // 指定されたポートでサーバーを起動
-  app.listen(PORT, () => {
+  const server = app.listen(PORT, () => {
     logger.info(`サーバーがポート${PORT}で起動しました。`);
     logger.info("利用可能なエンドポイント:");
     logger.info("- POST /ask");
     logger.info("- POST /test");
     logger.info("- POST /coaching");
+    logger.info("- POST /knowledge/add");
+    logger.info("- POST /knowledge/upload");
   });
 }
 

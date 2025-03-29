@@ -6,3 +6,6 @@ node_modules/
 
 # package-lock.json（ロックファイルはコミットしない場合）
 package-lock.json
+
+# 既存の内容に追加
+backend/uploads/
